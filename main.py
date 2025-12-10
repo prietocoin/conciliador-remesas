@@ -1,14 +1,16 @@
 from flask import Flask, request, jsonify
+import sqlite3
 import traceback
 
 app = Flask(__name__)
 
 # =========================================================
-# CONFIGURACIÓN GLOBAL
+# CONFIGURACIÓN
 # =========================================================
+DB_NAME = "espejo.db"
 MARGEN_TOLERANCIA = 0.01
 
-# 1. LISTA BLANCA (ASESORES)
+# LISTA DE ASESORES (TU LISTA BLANCA)
 LISTA_ASESORES = {
     "ALEJANDRA", "MERLI", "JUNIOR", "KARLA", "LUIS", 
     "ROSANGEL", "BEATRIZ", "ENZO", "LUISANY", "PRACELIS", 
@@ -16,7 +18,7 @@ LISTA_ASESORES = {
     "ROSIELS", "CARLOS", "NELSON"
 }
 
-# 2. MATRIZ DE GANANCIA (CORREGIDA)
+# MATRIZ DE GANANCIA
 MATRIZ_GANANCIA = {
     "USDT":  {"USDT": 1.00, "PYUSD": 1.20, "PEN": 0.90, "COP": 0.90, "CLP": 0.90, "ARS": 0.90, "USD": 0.90, "ECU": 0.90, "PAN": 0.90, "MXN": 0.90, "BRL": 0.90, "VES": 0.90, "PYG": 0.90, "EUR": 0.90, "DOP": 0.90, "BOB": 0.90, "CRC": 0.90, "UYU": 0.90, "OXXO": 0.90},
     "PYUSD": {"USDT": 1.20, "PYUSD": 1.00, "PEN": 1.20, "COP": 1.20, "CLP": 1.20, "ARS": 1.20, "USD": 1.20, "ECU": 0,    "PAN": 1.20, "MXN": 0,    "BRL": 1.20, "VES": 1.20, "PYG": 1.20, "EUR": 1.20, "DOP": 1.20, "BOB": 0,    "CRC": 1.20, "UYU": 0,    "OXXO": 1.20},
@@ -40,7 +42,7 @@ MATRIZ_GANANCIA = {
 }
 
 # =========================================================
-# FUNCIONES AUXILIARES (LIMPIEZA)
+# FUNCIONES AUXILIARES
 # =========================================================
 def safe_float(val):
     if not val: return 0.0
@@ -52,162 +54,148 @@ def clean_key(key):
     return str(key).strip().upper()
 
 def encontrar_valor(item, posibles):
-    """Busca un valor probando mayúsculas, minúsculas y títulos"""
     for nombre in posibles:
         for k, v in item.items():
             if k.strip().upper() == nombre.upper(): return v
     return 0
 
-def limpiar_tasas(lista_tasas):
-    nuevas = []
-    for t in lista_tasas:
-        new_row = {}
-        for k,v in t.items():
-            new_row[clean_key(k)] = v
-        nuevas.append(new_row)
-    return nuevas
+# --- GESTIÓN BASE DE DATOS ---
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Tabla Depósitos (Espejo)
+    c.execute('''CREATE TABLE IF NOT EXISTS depositos 
+                 (id INTEGER PRIMARY KEY, hash_largo TEXT, nombre TEXT, monto REAL, moneda TEXT, tasa TEXT, usado INTEGER)''')
+    # Tabla Tasas (Espejo) - La guardamos como JSON string en una sola columna para simplificar
+    c.execute('''CREATE TABLE IF NOT EXISTS tasas 
+                 (id INTEGER PRIMARY KEY, timestamp INTEGER, datos_json TEXT)''')
+    conn.commit()
+    conn.close()
+
+# Inicializamos al arrancar
+init_db()
 
 # =========================================================
-# SERVICIO 1: FILTRADO (LISTA BLANCA + REDUCCIÓN)
+# ENDPOINT 1: ACTUALIZAR LA BASE DE DATOS (ESPEJO)
 # =========================================================
-@app.route('/servicio_filtrar', methods=['POST'])
-def filtrar():
+@app.route('/actualizar_db', methods=['POST'])
+def actualizar_db():
     try:
         data = request.json
-        pago = data.get('pago', {})
         depositos = data.get('depositos', [])
-
-        g2 = str(pago.get('Grupo_2', '')).strip().upper()
-        
-        # --- 1. ¿ES ASESOR VÁLIDO? ---
-        if g2 not in LISTA_ASESORES:
-            return jsonify({
-                "candidatos": [],
-                "status": "IGNORADO",
-                "info": f"Asesor '{g2}' no está en la lista blanca"
-            })
-
-        # --- 2. BUSCAR DEPÓSITOS DEL MISMO NOMBRE ---
-        # "Quiero los depósitos donde Grupo_1 sea igual a g2"
-        candidatos = []
-        nombres_monto = ['Monto', 'monto', 'MONTO', 'Amount']
-
-        for d in depositos:
-            g1 = str(d.get('Grupo_1', '')).strip().upper()
-            
-            if g1 == g2:
-                # Normalizamos datos para el siguiente paso
-                monto = safe_float(encontrar_valor(d, nombres_monto))
-                
-                # Ignorar depósitos en 0 para evitar errores después
-                if monto <= 0: continue
-
-                candidatos.append({
-                    "original": d,
-                    "monto": monto,
-                    "moneda": str(d.get('Moneda', 'USD')).strip().upper()
-                })
-        
-        if not candidatos:
-            return jsonify({
-                "candidatos": [], 
-                "status": "PENDIENTE", 
-                "info": f"No hay depósitos para el asesor {g2}"
-            })
-
-        return jsonify({"candidatos": candidatos, "status": "BUSCANDO"})
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# =========================================================
-# SERVICIO 2: TASA (BÚSQUEDA TEMPORAL)
-# =========================================================
-@app.route('/servicio_tasa', methods=['POST'])
-def tasa():
-    try:
-        data = request.json
-        ts_pago_raw = data.get('timestamp')
         tasas = data.get('tasas', [])
         
-        # Limpiamos tasas al vuelo
-        tasas_limpias = limpiar_tasas(tasas)
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
         
-        ts_pago = int(safe_float(ts_pago_raw))
-        if ts_pago == 0: return jsonify({"tasa": None, "msg": "Timestamp pago 0"})
-
-        tasa_elegida = None
-        menor_diff = float('inf')
-
-        for t in tasas_limpias:
-            try:
-                # Buscamos Timestamp con búsqueda flexible
-                ts_tasa = int(safe_float(encontrar_valor(t, ['Timestamp', 'timestamp'])))
-                if ts_tasa == 0: continue
-
-                diff = ts_pago - ts_tasa
-                # Si es del pasado (diff >= 0) y es la más cercana
-                if 0 <= diff < menor_diff:
-                    menor_diff = diff
-                    tasa_elegida = t
-            except: continue
+        # 1. Limpiamos lo viejo
+        c.execute("DELETE FROM depositos")
+        c.execute("DELETE FROM tasas")
+        
+        # 2. Insertamos Depósitos
+        nombres_monto = ['Monto', 'monto', 'MONTO', 'Amount']
+        count_deps = 0
+        
+        for d in depositos:
+            g1 = str(d.get('Grupo_1', '')).strip().upper()
+            if g1 not in LISTA_ASESORES: continue # Filtro previo
             
-        return jsonify(tasa_elegida if tasa_elegida else {})
+            monto = safe_float(encontrar_valor(d, nombres_monto))
+            if monto <= 0: continue
+            
+            moneda = str(d.get('Moneda', 'USD')).strip().upper()
+            tasa_txt = str(d.get('Tasa', '')).strip().upper()
+            hash_l = str(d.get('Hash_Largo', ''))
+            
+            c.execute("INSERT INTO depositos (hash_largo, nombre, monto, moneda, tasa, usado) VALUES (?, ?, ?, ?, ?, 0)",
+                      (hash_l, g1, monto, moneda, tasa_txt))
+            count_deps += 1
+
+        # 3. Insertamos Tasas
+        import json
+        for t in tasas:
+            try:
+                ts = int(safe_float(encontrar_valor(t, ['Timestamp', 'timestamp'])))
+                if ts > 0:
+                    # Limpiamos claves antes de guardar
+                    clean_t = {clean_key(k): safe_float(v) for k,v in t.items()}
+                    c.execute("INSERT INTO tasas (timestamp, datos_json) VALUES (?, ?)", (ts, json.dumps(clean_t)))
+            except: continue
+
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "OK", "msg": f"Base de datos actualizada. {count_deps} depósitos cargados."})
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 # =========================================================
-# SERVICIO 3: CÁLCULO (MATEMÁTICA PURA)
+# ENDPOINT 2: CONCILIAR UN PAGO (CONSULTA SQL)
 # =========================================================
-@app.route('/servicio_calculo', methods=['POST'])
-def calculo():
+@app.route('/conciliar', methods=['POST'])
+def conciliar():
     try:
-        data = request.json
+        pago = request.json.get('pago', {})
         
-        # Si el paso 1 dijo IGNORADO, no calculamos nada
-        if data.get('status_previo') == "IGNORADO":
-             return jsonify({"status": "IGNORADO", "info": data.get('info_previo')})
-        
-        if data.get('status_previo') == "PENDIENTE":
-             return jsonify({"status": "PENDIENTE", "info": data.get('info_previo')})
-
-        pago = data.get('pago', {})
-        candidatos = data.get('candidatos', [])
-        tasa_row = data.get('tasa', {})
-
-        if not candidatos: return jsonify({"status": "PENDIENTE", "info": "Sin candidatos recibidos"})
-        if not tasa_row: return jsonify({"status": "PENDIENTE", "info": "Sin tasa encontrada"})
-
         # Datos del Pago
-        monto_pago = safe_float(encontrar_valor(pago, ['Monto', 'monto']))
+        g2 = str(pago.get('Grupo_2', '')).strip().upper()
+        
+        if g2 not in LISTA_ASESORES:
+            return jsonify({"STATUS": "IGNORADO", "INFO": "Asesor no autorizado"})
+
+        nombres_monto = ['Monto', 'monto', 'MONTO', 'Amount']
+        monto_pago = safe_float(encontrar_valor(pago, nombres_monto))
         moneda_pago = str(pago.get('Moneda', 'USD')).strip().upper()
+        
+        ts_pago = 0
+        try: ts_pago = int(safe_float(encontrar_valor(pago, ['Timestamp', 'timestamp'])))
+        except: pass
 
-        if monto_pago <= 0: return jsonify({"status": "ERROR", "info": "Monto pago es 0"})
+        if monto_pago <= 0:
+            return jsonify({"STATUS": "ERROR", "INFO": "Monto pago 0"})
 
-        best_diff = 1000
+        # --- CONEXIÓN DB ---
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        # 1. BUSCAR TASA VIGENTE (SQL + Python)
+        # Traemos la tasa más reciente anterior al pago
+        c.execute("SELECT datos_json FROM tasas WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1", (ts_pago,))
+        row_tasa = c.fetchone()
+        
+        if not row_tasa:
+            conn.close()
+            return jsonify({"STATUS": "PENDIENTE", "INFO": "Sin tasa historica"})
+            
+        import json
+        tasa_row = json.loads(row_tasa['datos_json'])
+
+        # 2. BUSCAR CANDIDATOS (SQL RÁPIDO)
+        # "Dame los depósitos libres que se llamen igual"
+        c.execute("SELECT * FROM depositos WHERE nombre = ? AND usado = 0", (g2,))
+        candidatos = c.fetchall()
+
+        if not candidatos:
+            conn.close()
+            return jsonify({"STATUS": "PENDIENTE", "INFO": "Sin depositos nombre"})
+
+        # 3. MATEMÁTICA
         match_found = None
+        best_diff = 1000
         info = ""
 
-        # --- BUCLE MATEMÁTICO ---
         for cand in candidatos:
             moneda_dep = cand['moneda']
-            
-            # 1. Matriz
             factor = MATRIZ_GANANCIA.get(moneda_dep, {}).get(moneda_pago)
             if not factor: continue
 
-            # 2. Tasas
             key_in = f"{moneda_dep}+"
             key_out = f"{moneda_pago}-"
             
-            # Búsqueda flexible de columnas en la tasa (ej: 'COP+' o 'cop+')
-            val_in_raw = encontrar_valor(tasa_row, [key_in])
-            val_out_raw = encontrar_valor(tasa_row, [key_out])
-            
-            val_in = safe_float(val_in_raw)
-            val_out = safe_float(val_out_raw)
+            val_in = tasa_row.get(key_in, 0)
+            val_out = tasa_row.get(key_out, 0)
 
-            # --- PROTECCIÓN DIVISIÓN POR CERO ---
             if val_in > 0 and val_out > 0:
                 teorico = cand['monto'] * (1/val_in) * val_out * factor
                 diff = abs(monto_pago - teorico) / monto_pago
@@ -215,24 +203,34 @@ def calculo():
                 if diff <= MARGEN_TOLERANCIA and diff < best_diff:
                     best_diff = diff
                     match_found = cand
-                    info = f"Match! Diff: {round(diff*100, 2)}% | Factor: {factor}"
+                    info = f"Match! Diff: {round(diff*100, 2)}%"
 
+        # 4. GUARDAR RESULTADO
+        res = {}
         if match_found:
-            return jsonify({
-                "status": "ASIGNADO",
-                "hash": match_found['original'].get('Hash_Largo'),
-                "monto": match_found['original'].get('Monto'),
-                "info": info
-            })
+            # Marcamos como usado en la DB
+            c.execute("UPDATE depositos SET usado = 1 WHERE id = ?", (match_found['id'],))
+            conn.commit()
+            
+            res = {
+                "STATUS": "ASIGNADO",
+                "MATCH_HASH": match_found['hash_largo'],
+                "MATCH_MONTO": match_found['monto'],
+                "INFO": info
+            }
         else:
-            # Diagnóstico si falló
-            return jsonify({
-                "status": "PENDIENTE", 
-                "info": f"Matemática falló. Mínima diff: {round(best_diff*100,2) if best_diff!=1000 else 'N/A'}%"
-            })
+            res = {"STATUS": "PENDIENTE", "INFO": info}
+
+        conn.close()
+        
+        # Devolvemos el pago enriquecido
+        pago.update(res)
+        return jsonify(pago)
 
     except Exception as e:
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 if __name__ == '__main__':
+    # Inicializar DB al arrancar por si acaso
+    init_db() 
     app.run(host='0.0.0.0', port=80)
