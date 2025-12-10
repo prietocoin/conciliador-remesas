@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import traceback
-import bisect
 
 app = Flask(__name__)
 
@@ -10,7 +9,7 @@ app = Flask(__name__)
 MARGEN_TOLERANCIA = 0.01
 
 # =========================================================
-# MATRIZ DE GANANCIA NATIVA
+# MATRIZ DE GANANCIA
 # =========================================================
 MATRIZ_GANANCIA = {
     "USDT":  {"USDT": 1.00, "PYUSD": 1.20, "PEN": 0.90, "COP": 0.90, "CLP": 0.90, "ARS": 0.90, "USD": 0.90, "ECU": 0.90, "PAN": 0.90, "MXN": 0.90, "BRL": 0.90, "VES": 0.90, "PYG": 0.90, "EUR": 0.90, "DOP": 0.90, "BOB": 0.90, "CRC": 0.90, "UYU": 0.90, "OXXO": 0.90},
@@ -35,10 +34,11 @@ MATRIZ_GANANCIA = {
 }
 
 # =========================================================
-# FUNCIONES AUXILIARES (OPTIMIZADAS)
+# FUNCIONES AUXILIARES (LIMPIEZA)
 # =========================================================
 def safe_float(val):
     if not val: return 0.0
+    # Limpiamos $, comas y espacios
     s = str(val).replace(',', '.').replace('$', '').replace(' ', '')
     try: return float(s)
     except: return 0.0
@@ -55,7 +55,48 @@ def encontrar_valor_flexible(item, posibles_nombres):
     return 0
 
 # =========================================================
-# ENDPOINT PRINCIPAL (LÓGICA TURBO)
+# DEBUGGER SIMPLE
+# =========================================================
+def debug_match(pago, pool, tasa_row):
+    # Solo chequeos básicos para no saturar memoria
+    if pago['monto'] <= 0:
+        return f"FALLO: Monto 0. Cols: {list(pago['raw'].keys())}"
+    
+    if not tasa_row:
+        return f"FALLO: Sin Tasa para fecha {pago['ts']}"
+
+    candidatos = [d for d in pool if d['nombre'] == pago['nombre']]
+    if not candidatos:
+        return f"FALLO: Sin depósitos para {pago['nombre']}"
+        
+    return f"FALLO: {len(candidatos)} candidatos pero matemáticas no cuadran (Monto pago: {pago['monto']})"
+
+# =========================================================
+# TASA VIGENTE (SIMPLE Y LINEAL)
+# =========================================================
+def obtener_tasa_vigente(ts_pago, lista_tasas):
+    if not ts_pago: return None
+    tasa_candidata = None
+    menor_diff = float('inf')
+    
+    for tasa in lista_tasas:
+        try:
+            # Buscamos 'Timestamp' o 'timestamp'
+            ts_raw = encontrar_valor_flexible(tasa, ['Timestamp', 'timestamp'])
+            ts_tasa = int(safe_float(ts_raw))
+            
+            diff = int(ts_pago) - ts_tasa
+            
+            # Si la tasa es del pasado (diff >= 0) y es la más cercana
+            if 0 <= diff < menor_diff:
+                menor_diff = diff
+                tasa_candidata = tasa
+        except: continue
+        
+    return tasa_candidata
+
+# =========================================================
+# ENDPOINT PRINCIPAL
 # =========================================================
 @app.route('/conciliar', methods=['POST'])
 def conciliar():
@@ -63,41 +104,16 @@ def conciliar():
         data = request.json
         pagos = data.get('pagos', [])
         depositos = data.get('depositos', [])
-        tasas_sucias = data.get('tasas', [])
+        tasas_list = data.get('tasas', [])
 
-        # 1. PRE-PROCESAMIENTO DE TASAS (UNA SOLA VEZ)
-        # Convertimos todo a números y ordenamos por Timestamp para búsqueda binaria
-        tasas_ordenadas = []
-        for tasa in tasas_sucias:
-            try:
-                # Extraemos el Timestamp y lo convertimos
-                ts_raw = encontrar_valor_flexible(tasa, ['Timestamp', 'timestamp'])
-                ts = int(safe_float(ts_raw))
-                if ts == 0: continue
-
-                # Limpiamos las claves de la fila (PEN+, etc.)
-                fila_limpia = {}
-                for k, v in tasa.items():
-                    fila_limpia[clean_key(k)] = safe_float(v)
-                
-                fila_limpia['_TS'] = ts
-                fila_limpia['_IDTAS'] = str(tasa.get('IDTAS', '')).strip().upper()
-                tasas_ordenadas.append(fila_limpia)
-            except: continue
-        
-        # Ordenamos por timestamp (Vital para bisect)
-        tasas_ordenadas.sort(key=lambda x: x['_TS'])
-        
-        # Extraemos solo los timestamps para buscar rápido
-        keys_timestamps = [t['_TS'] for t in tasas_ordenadas]
-
-        # 2. PRE-PROCESAMIENTO DE DEPÓSITOS (POOL)
-        nombres_monto = ['Monto', 'monto', 'MONTO', 'Amount', 'amount']
+        # 1. Preparar Pool de Depósitos
+        nombres_monto = ['Monto', 'monto', 'MONTO', 'Amount']
         pool = []
         
         for d in depositos:
             g1 = str(d.get('Grupo_1', '')).strip().upper()
-            monto = safe_float(encontrar_valor_flexible(d, nombres_monto))
+            raw_monto = encontrar_valor_flexible(d, nombres_monto)
+            monto = safe_float(raw_monto)
             
             if monto <= 0: continue
 
@@ -111,62 +127,60 @@ def conciliar():
 
         resultados = []
 
-        # 3. BUCLE DE PAGOS
+        # 2. Bucle de Pagos
         for pago in pagos:
             g2 = str(pago.get('Grupo_2', '')).strip().upper()
-            monto_pago = safe_float(encontrar_valor_flexible(pago, nombres_monto))
-            moneda_pago = str(pago.get('Moneda', 'USD')).strip().upper()
+            raw_monto_p = encontrar_valor_flexible(pago, nombres_monto)
+            monto_p = safe_float(raw_monto_p)
             
-            ts_pago = 0
+            p_data = {
+                "raw": pago,
+                "nombre": g2,
+                "monto": monto_p,
+                "moneda": str(pago.get('Moneda', 'USD')).strip().upper(),
+                "ts": None
+            }
+            
             ts_raw = encontrar_valor_flexible(pago, ['Timestamp', 'timestamp'])
-            try: ts_pago = int(safe_float(ts_raw))
+            try: p_data['ts'] = int(safe_float(ts_raw))
             except: pass
 
-            info_debug = ""
-            match_found = None
-
-            # --- A. BÚSQUEDA DE TASA (BINARY SEARCH) ---
-            # Encontramos la tasa vigente en 0.0001 segundos
-            tasa_row = None
-            if ts_pago > 0 and keys_timestamps:
-                # bisect_right encuentra el punto de inserción a la derecha
-                idx = bisect.bisect_right(keys_timestamps, ts_pago)
-                if idx > 0:
-                    tasa_row = tasas_ordenadas[idx - 1]
+            tasa_row = obtener_tasa_vigente(p_data['ts'], tasas_list)
             
-            # --- B. MATCHING ---
-            if monto_pago > 0:
-                candidatos = [d for d in pool if d['disponible'] and d['nombre'] == g2]
+            match_found = None
+            info_debug = ""
 
-                if not candidatos:
-                    info_debug = f"Sin depósitos para {g2}"
-                elif not tasa_row:
-                    info_debug = f"Sin tasa para fecha {ts_pago}"
-                else:
-                    best_diff = 1000
+            # --- PROTECCIÓN DIVISIÓN POR CERO ---
+            if p_data['monto'] > 0 and tasa_row:
+                candidatos = [d for d in pool if d['disponible'] and d['nombre'] == p_data['nombre']]
+                best_diff = 1000
+                
+                for cand in candidatos:
+                    factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(p_data['moneda'])
+                    if not factor: continue 
+
+                    # Nombres de columnas en la hoja de tasas
+                    key_in = f"{cand['moneda']}+"
+                    key_out = f"{p_data['moneda']}-"
                     
-                    for cand in candidatos:
-                        factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(moneda_pago)
-                        if not factor: continue 
-
-                        key_in = f"{cand['moneda']}+"
-                        key_out = f"{moneda_pago}-"
+                    # Usamos búsqueda flexible también para las tasas (por si "COP+" es "cop+")
+                    val_in_raw = encontrar_valor_flexible(tasa_row, [key_in, key_in.lower(), key_in.upper()])
+                    val_out_raw = encontrar_valor_flexible(tasa_row, [key_out, key_out.lower(), key_out.upper()])
+                    
+                    val_in = safe_float(val_in_raw)
+                    val_out = safe_float(val_out_raw)
+                    
+                    # --- AQUÍ EVITAMOS EL ERROR ---
+                    if val_in > 0 and val_out > 0:
+                        monto_teorico = cand['monto'] * (1/val_in) * val_out * factor
+                        diff = abs(p_data['monto'] - monto_teorico) / p_data['monto']
                         
-                        val_in = tasa_row.get(key_in, 0)
-                        val_out = tasa_row.get(key_out, 0)
-                        
-                        if val_in > 0 and val_out > 0:
-                            monto_teorico = cand['monto'] * (1/val_in) * val_out * factor
-                            diff = abs(monto_pago - monto_teorico) / monto_pago
-                            
-                            if diff <= MARGEN_TOLERANCIA and diff < best_diff:
-                                best_diff = diff
-                                match_found = cand
-                                info_debug = f"Match! Diff: {round(diff*100, 2)}%"
-            else:
-                info_debug = "Monto pago inválido (0)"
+                        if diff <= MARGEN_TOLERANCIA and diff < best_diff:
+                            best_diff = diff
+                            match_found = cand
+                            info_debug = f"Match! Diff: {round(diff*100, 2)}%"
 
-            # --- C. RESULTADO ---
+            # Resultado
             res_data = {}
             if match_found:
                 match_found['disponible'] = False
@@ -177,7 +191,8 @@ def conciliar():
                     "INFO": info_debug
                 }
             else:
-                res_data = {"STATUS": "PENDIENTE", "INFO": info_debug}
+                debug_msg = debug_match(p_data, pool, tasa_row)
+                res_data = {"STATUS": "PENDIENTE", "INFO": debug_msg}
             
             pago.update(res_data)
             resultados.append(pago)
@@ -187,6 +202,5 @@ def conciliar():
     except Exception as e:
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
-import bisect # Importante para la optimización
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
