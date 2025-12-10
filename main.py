@@ -3,14 +3,10 @@ import traceback
 
 app = Flask(__name__)
 
-# =========================================================
-# CONFIGURACIÓN
-# =========================================================
+# Configuración
 MARGEN_TOLERANCIA = 0.01
 
-# =========================================================
-# MATRIZ DE GANANCIA NATIVA
-# =========================================================
+# Matriz de Ganancia (Sin cambios)
 MATRIZ_GANANCIA = {
     "USDT":  {"USDT": 1.00, "PYUSD": 1.20, "PEN": 0.90, "COP": 0.90, "CLP": 0.90, "ARS": 0.90, "USD": 0.90, "ECU": 0.90, "PAN": 0.90, "MXN": 0.90, "BRL": 0.90, "VES": 0.90, "PYG": 0.90, "EUR": 0.90, "DOP": 0.90, "BOB": 0.90, "CRC": 0.90, "UYU": 0.90, "OXXO": 0.90},
     "PYUSD": {"USDT": 1.20, "PYUSD": 1.00, "PEN": 1.20, "COP": 1.20, "CLP": 1.20, "ARS": 1.20, "USD": 1.20, "ECU": 0,    "PAN": 1.20, "MXN": 0,    "BRL": 1.20, "VES": 1.20, "PYG": 1.20, "EUR": 1.20, "DOP": 1.20, "BOB": 0,    "CRC": 1.20, "UYU": 0,    "OXXO": 1.20},
@@ -34,21 +30,18 @@ MATRIZ_GANANCIA = {
 }
 
 # =========================================================
-# FUNCIONES AUXILIARES DE LIMPIEZA
+# FUNCIONES DE LIMPIEZA
 # =========================================================
 def safe_float(val):
-    """Convierte texto sucio ('3,500' o '$3500') a float puro."""
     if not val: return 0.0
     s = str(val).replace(',', '.').replace('$', '').replace(' ', '')
     try: return float(s)
     except: return 0.0
 
 def clean_key(key):
-    """Limpia encabezados (' COP+ ' -> 'COP+')"""
     return str(key).strip().upper()
 
 def limpiar_tasas(lista_tasas):
-    """Reconstruye la lista de tasas con claves limpias."""
     nuevas_tasas = []
     for tasa in lista_tasas:
         clean_row = {}
@@ -58,11 +51,14 @@ def limpiar_tasas(lista_tasas):
     return nuevas_tasas
 
 # =========================================================
-# HELPER: CHISMOSO (DEBUGGER)
+# DIAGNÓSTICO (CHISMOSO)
 # =========================================================
 def debug_match(pago, pool, tasa_row):
     logs = []
     
+    if pago['monto'] <= 0:
+        return "FALLO: Monto del Pago detectado como 0 o vacío."
+
     candidatos_nombre = [d for d in pool if d['nombre'] == pago['nombre']]
     if not candidatos_nombre:
         return f"FALLO: Asesor '{pago['nombre']}' no tiene depósitos."
@@ -85,21 +81,15 @@ def debug_match(pago, pool, tasa_row):
         key_in = f"{cand['moneda']}+"
         key_out = f"{pago['moneda']}-"
         
-        # --- DIAGNOSTICO DE VALORES ---
-        val_in_raw = tasa_row.get(key_in, 0)
-        val_out_raw = tasa_row.get(key_out, 0)
-        val_in = safe_float(val_in_raw)
-        val_out = safe_float(val_out_raw)
+        val_in = safe_float(tasa_row.get(key_in, 0))
+        val_out = safe_float(tasa_row.get(key_out, 0))
         
         if val_in == 0:
-            # Aquí mostramos qué claves tiene la fila para que veas el error
-            claves_disp = list(tasa_row.keys())[:5] # Solo las primeras 5 para no llenar
-            logs.append(f"ERR: '{key_in}' es 0. Disp: {claves_disp}")
+            logs.append(f"ERR: Tasa '{key_in}' es 0.")
             continue
             
         teorico = cand['monto'] * (1/val_in) * val_out * factor
         diff = abs(pago['monto'] - teorico) / pago['monto']
-        
         logs.append(f"Dep({cand['monto']})->Calc({round(teorico,2)}) Diff={round(diff*100, 2)}%")
 
     return " | ".join(logs)[:500] 
@@ -114,7 +104,6 @@ def obtener_tasa_vigente(ts_pago, lista_tasas):
     
     for tasa in lista_tasas:
         try:
-            # Usamos safe_float por seguridad
             ts_tasa = int(safe_float(tasa.get('Timestamp', 0)))
             diff = int(ts_pago) - ts_tasa 
             if 0 <= diff < menor_diff:
@@ -133,16 +122,17 @@ def conciliar():
         pagos = data.get('pagos', [])
         depositos = data.get('depositos', [])
         
-        # 1. LIMPIEZA AGRESIVA DE TASAS AL INICIO
         tasas_sucias = data.get('tasas', [])
         tasas_list = limpiar_tasas(tasas_sucias)
 
-        # 2. Pool de Depósitos
         pool = []
         for d in depositos:
             g1 = str(d.get('Grupo_1', '')).strip().upper()
             monto = safe_float(d.get('Monto', 0))
             
+            # --- PROTECCIÓN: IGNORAR DEPOSITOS EN CERO ---
+            if monto <= 0: continue 
+
             pool.append({
                 "original": d,
                 "nombre": g1, 
@@ -153,7 +143,6 @@ def conciliar():
 
         resultados = []
 
-        # 3. Bucle
         for pago in pagos:
             g2 = str(pago.get('Grupo_2', '')).strip().upper()
             
@@ -173,33 +162,36 @@ def conciliar():
             match_found = None
             info_debug = ""
 
-            candidatos = [d for d in pool if d['disponible'] and d['nombre'] == p_data['nombre']]
+            # --- PROTECCIÓN: SI EL PAGO ES 0, SALTAMOS MATCH ---
+            if p_data['monto'] > 0:
+                candidatos = [d for d in pool if d['disponible'] and d['nombre'] == p_data['nombre']]
 
-            if candidatos and tasa_row:
-                best_diff = 1000
-                
-                for cand in candidatos:
-                    factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(p_data['moneda'])
-                    if not factor: continue 
-
-                    key_in = f"{cand['moneda']}+"
-                    key_out = f"{p_data['moneda']}-"
+                if candidatos and tasa_row:
+                    best_diff = 1000
                     
-                    try:
-                        # Usamos safe_float para evitar errores con strings
-                        val_in = safe_float(tasa_row.get(key_in, 0))
-                        val_out = safe_float(tasa_row.get(key_out, 0))
+                    for cand in candidatos:
+                        factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(p_data['moneda'])
+                        if not factor: continue 
+
+                        key_in = f"{cand['moneda']}+"
+                        key_out = f"{p_data['moneda']}-"
                         
-                        # --- VERIFICACIÓN CRÍTICA ---
-                        if val_in > 0 and val_out > 0:
-                            monto_teorico = cand['monto'] * (1/val_in) * val_out * factor
-                            diff = abs(p_data['monto'] - monto_teorico) / p_data['monto']
+                        try:
+                            val_in = safe_float(tasa_row.get(key_in, 0))
+                            val_out = safe_float(tasa_row.get(key_out, 0))
                             
-                            if diff <= MARGEN_TOLERANCIA and diff < best_diff:
-                                best_diff = diff
-                                match_found = cand
-                                info_debug = f"Match! Diff: {round(diff*100, 2)}% | Factor: {factor}"
-                    except: continue
+                            # --- PROTECCIÓN ANTI-CRASH ---
+                            if val_in > 0 and val_out > 0:
+                                monto_teorico = cand['monto'] * (1/val_in) * val_out * factor
+                                diff = abs(p_data['monto'] - monto_teorico) / p_data['monto']
+                                
+                                if diff <= MARGEN_TOLERANCIA and diff < best_diff:
+                                    best_diff = diff
+                                    match_found = cand
+                                    info_debug = f"Match! Diff: {round(diff*100, 2)}% | Factor: {factor}"
+                        except: continue
+            else:
+                info_debug = "ALERTA: Monto pago es 0 o inválido"
 
             res_data = {}
             if match_found:
@@ -211,7 +203,11 @@ def conciliar():
                     "INFO": info_debug
                 }
             else:
-                debug_msg = debug_match(p_data, pool, tasa_row)
+                # Si el monto era > 0, llamamos al debug. Si era 0, ya tenemos el mensaje.
+                if p_data['monto'] > 0:
+                    debug_msg = debug_match(p_data, pool, tasa_row)
+                else:
+                    debug_msg = info_debug
                 res_data = {"STATUS": "PENDIENTE", "INFO": debug_msg}
             
             pago.update(res_data)
