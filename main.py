@@ -4,12 +4,12 @@ import traceback
 app = Flask(__name__)
 
 # =========================================================
-# 1. CONFIGURACIÓN
+# CONFIGURACIÓN
 # =========================================================
-MARGEN_TOLERANCIA = 0.01 # 1%
+MARGEN_TOLERANCIA = 0.01
 
 # =========================================================
-# 2. MATRIZ DE GANANCIA NATIVA
+# MATRIZ DE GANANCIA NATIVA
 # =========================================================
 MATRIZ_GANANCIA = {
     "USDT":  {"USDT": 1.00, "PYUSD": 1.20, "PEN": 0.90, "COP": 0.90, "CLP": 0.90, "ARS": 0.90, "USD": 0.90, "ECU": 0.90, "PAN": 0.90, "MXN": 0.90, "BRL": 0.90, "VES": 0.90, "PYG": 0.90, "EUR": 0.90, "DOP": 0.90, "BOB": 0.90, "CRC": 0.90, "UYU": 0.90, "OXXO": 0.90},
@@ -34,12 +34,9 @@ MATRIZ_GANANCIA = {
 }
 
 # =========================================================
-# 3. HELPER: DIAGNÓSTICO DETALLADO (EL CHISMOSO)
+# HELPER: CHISMOSO (DEBUGGER)
 # =========================================================
 def debug_match(pago, pool, tasa_row):
-    """
-    Si no hay match, explica POR QUÉ.
-    """
     logs = []
     
     # 1. Buscamos candidatos por Nombre
@@ -51,8 +48,7 @@ def debug_match(pago, pool, tasa_row):
     if not tasa_row:
         return "FALLO: No se encontró una Tasa (IDTAS) para la fecha del pago."
 
-    # 3. Analizamos Matemáticas
-    logs.append(f"Candidatos encontrados: {len(candidatos_nombre)}.")
+    logs.append(f"Cand: {len(candidatos_nombre)}")
     
     for cand in candidatos_nombre:
         if not cand['disponible']:
@@ -62,16 +58,22 @@ def debug_match(pago, pool, tasa_row):
         try:
             factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(pago['moneda'])
             if not factor:
-                logs.append(f"Dep({cand['monto']} {cand['moneda']}): Sin factor matriz hacia {pago['moneda']}.")
+                logs.append(f"Dep({cand['moneda']}->{pago['moneda']}): Sin factor matriz.")
                 continue
                 
             key_in = f"{cand['moneda']}+"
             key_out = f"{pago['moneda']}-"
+            
+            # --- PROTECCIÓN CONTRA CERO ---
             val_in = float(tasa_row.get(key_in, 0))
             val_out = float(tasa_row.get(key_out, 0))
             
-            if val_in == 0 or val_out == 0:
-                logs.append(f"Dep({cand['monto']}): Tasas {key_in}/{key_out} son 0.")
+            if val_in == 0:
+                logs.append(f"Dep({cand['monto']}): Tasa '{key_in}' es 0.")
+                continue
+                
+            if val_out == 0:
+                logs.append(f"Dep({cand['monto']}): Tasa '{key_out}' es 0.")
                 continue
 
             teorico = cand['monto'] * (1/val_in) * val_out * factor
@@ -81,10 +83,10 @@ def debug_match(pago, pool, tasa_row):
         except Exception as e:
             logs.append(f"Error calc: {str(e)}")
 
-    return " | ".join(logs)[:500] # Recortamos para que quepa en Excel
+    return " | ".join(logs)[:500] 
 
 # =========================================================
-# 4. HELPER: TASA POR TIEMPO
+# HELPER: TASA POR TIEMPO
 # =========================================================
 def obtener_tasa_vigente(ts_pago, lista_tasas):
     if not ts_pago: return None
@@ -102,7 +104,7 @@ def obtener_tasa_vigente(ts_pago, lista_tasas):
     return tasa_candidata
 
 # =========================================================
-# 5. ENDPOINT PRINCIPAL
+# ENDPOINT PRINCIPAL
 # =========================================================
 @app.route('/conciliar', methods=['POST'])
 def conciliar():
@@ -121,7 +123,7 @@ def conciliar():
             
             pool.append({
                 "original": d,
-                "nombre": g1, # Nombre completo
+                "nombre": g1, 
                 "monto": monto,
                 "moneda": str(d.get('Moneda', 'USD')).strip().upper(),
                 "disponible": True
@@ -143,7 +145,8 @@ def conciliar():
             except: pass
             
             if pago.get('Timestamp'):
-                p_data['ts'] = int(pago.get('Timestamp'))
+                try: p_data['ts'] = int(pago.get('Timestamp'))
+                except: pass
 
             # Tasa Vigente
             tasa_row = obtener_tasa_vigente(p_data['ts'], tasas_list)
@@ -158,9 +161,11 @@ def conciliar():
                 best_diff = 1000
                 
                 for cand in candidatos:
+                    # 1. Matriz
                     factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(p_data['moneda'])
                     if not factor: continue 
 
+                    # 2. Tasas
                     key_in = f"{cand['moneda']}+"
                     key_out = f"{p_data['moneda']}-"
                     
@@ -168,6 +173,7 @@ def conciliar():
                         val_in = float(tasa_row.get(key_in, 0))
                         val_out = float(tasa_row.get(key_out, 0))
                         
+                        # --- PROTECCIÓN ANTI-CRASH ---
                         if val_in > 0 and val_out > 0:
                             monto_teorico = cand['monto'] * (1/val_in) * val_out * factor
                             diff = abs(p_data['monto'] - monto_teorico) / p_data['monto']
@@ -189,7 +195,7 @@ def conciliar():
                     "INFO": info_debug
                 }
             else:
-                # AQUÍ LLAMAMOS AL CHISMOSO PARA LLENAR LA INFO
+                # DEBUG CUANDO FALLA
                 debug_msg = debug_match(p_data, pool, tasa_row)
                 res_data = {"STATUS": "PENDIENTE", "INFO": debug_msg}
             
