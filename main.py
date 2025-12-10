@@ -34,54 +34,73 @@ MATRIZ_GANANCIA = {
 }
 
 # =========================================================
+# FUNCIONES AUXILIARES DE LIMPIEZA
+# =========================================================
+def safe_float(val):
+    """Convierte texto sucio ('3,500' o '$3500') a float puro."""
+    if not val: return 0.0
+    s = str(val).replace(',', '.').replace('$', '').replace(' ', '')
+    try: return float(s)
+    except: return 0.0
+
+def clean_key(key):
+    """Limpia encabezados (' COP+ ' -> 'COP+')"""
+    return str(key).strip().upper()
+
+def limpiar_tasas(lista_tasas):
+    """Reconstruye la lista de tasas con claves limpias."""
+    nuevas_tasas = []
+    for tasa in lista_tasas:
+        clean_row = {}
+        for k, v in tasa.items():
+            clean_row[clean_key(k)] = v
+        nuevas_tasas.append(clean_row)
+    return nuevas_tasas
+
+# =========================================================
 # HELPER: CHISMOSO (DEBUGGER)
 # =========================================================
 def debug_match(pago, pool, tasa_row):
     logs = []
     
-    # 1. Buscamos candidatos por Nombre
     candidatos_nombre = [d for d in pool if d['nombre'] == pago['nombre']]
     if not candidatos_nombre:
-        return f"FALLO: No hay depósitos para el asesor '{pago['nombre']}'."
+        return f"FALLO: Asesor '{pago['nombre']}' no tiene depósitos."
     
-    # 2. ¿Tenemos Tasa Histórica?
     if not tasa_row:
-        return "FALLO: No se encontró una Tasa (IDTAS) para la fecha del pago."
+        return f"FALLO: Sin Tasa IDTAS para timestamp {pago['ts']}."
 
     logs.append(f"Cand: {len(candidatos_nombre)}")
     
     for cand in candidatos_nombre:
         if not cand['disponible']:
-            logs.append(f"Dep({cand['monto']}): YA USADO.")
+            logs.append(f"Dep({cand['monto']}): USADO.")
             continue
 
-        try:
-            factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(pago['moneda'])
-            if not factor:
-                logs.append(f"Dep({cand['moneda']}->{pago['moneda']}): Sin factor matriz.")
-                continue
-                
-            key_in = f"{cand['moneda']}+"
-            key_out = f"{pago['moneda']}-"
+        factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(pago['moneda'])
+        if not factor:
+            logs.append(f"Dep({cand['moneda']}->{pago['moneda']}): Sin Matriz.")
+            continue
             
-            # --- PROTECCIÓN CONTRA CERO ---
-            val_in = float(tasa_row.get(key_in, 0))
-            val_out = float(tasa_row.get(key_out, 0))
+        key_in = f"{cand['moneda']}+"
+        key_out = f"{pago['moneda']}-"
+        
+        # --- DIAGNOSTICO DE VALORES ---
+        val_in_raw = tasa_row.get(key_in, 0)
+        val_out_raw = tasa_row.get(key_out, 0)
+        val_in = safe_float(val_in_raw)
+        val_out = safe_float(val_out_raw)
+        
+        if val_in == 0:
+            # Aquí mostramos qué claves tiene la fila para que veas el error
+            claves_disp = list(tasa_row.keys())[:5] # Solo las primeras 5 para no llenar
+            logs.append(f"ERR: '{key_in}' es 0. Disp: {claves_disp}")
+            continue
             
-            if val_in == 0:
-                logs.append(f"Dep({cand['monto']}): Tasa '{key_in}' es 0.")
-                continue
-                
-            if val_out == 0:
-                logs.append(f"Dep({cand['monto']}): Tasa '{key_out}' es 0.")
-                continue
-
-            teorico = cand['monto'] * (1/val_in) * val_out * factor
-            diff = abs(pago['monto'] - teorico) / pago['monto']
-            
-            logs.append(f"Dep({cand['monto']}) -> Calc({round(teorico,2)}) Diff={round(diff*100, 2)}%")
-        except Exception as e:
-            logs.append(f"Error calc: {str(e)}")
+        teorico = cand['monto'] * (1/val_in) * val_out * factor
+        diff = abs(pago['monto'] - teorico) / pago['monto']
+        
+        logs.append(f"Dep({cand['monto']})->Calc({round(teorico,2)}) Diff={round(diff*100, 2)}%")
 
     return " | ".join(logs)[:500] 
 
@@ -95,7 +114,8 @@ def obtener_tasa_vigente(ts_pago, lista_tasas):
     
     for tasa in lista_tasas:
         try:
-            ts_tasa = int(tasa.get('Timestamp', 0))
+            # Usamos safe_float por seguridad
+            ts_tasa = int(safe_float(tasa.get('Timestamp', 0)))
             diff = int(ts_pago) - ts_tasa 
             if 0 <= diff < menor_diff:
                 menor_diff = diff
@@ -112,14 +132,16 @@ def conciliar():
         data = request.json
         pagos = data.get('pagos', [])
         depositos = data.get('depositos', [])
-        tasas_list = data.get('tasas', [])
+        
+        # 1. LIMPIEZA AGRESIVA DE TASAS AL INICIO
+        tasas_sucias = data.get('tasas', [])
+        tasas_list = limpiar_tasas(tasas_sucias)
 
-        # Pool de Depósitos
+        # 2. Pool de Depósitos
         pool = []
         for d in depositos:
             g1 = str(d.get('Grupo_1', '')).strip().upper()
-            try: monto = float(d.get('Monto', 0) or 0)
-            except: monto = 0.0
+            monto = safe_float(d.get('Monto', 0))
             
             pool.append({
                 "original": d,
@@ -131,49 +153,44 @@ def conciliar():
 
         resultados = []
 
-        # Bucle Uno a Uno
+        # 3. Bucle
         for pago in pagos:
             g2 = str(pago.get('Grupo_2', '')).strip().upper()
             
             p_data = {
                 "nombre": g2,
-                "monto": 0.0,
+                "monto": safe_float(pago.get('Monto', 0)),
                 "moneda": str(pago.get('Moneda', 'USD')).strip().upper(),
                 "ts": None
             }
-            try: p_data['monto'] = float(pago.get('Monto', 0) or 0)
-            except: pass
             
             if pago.get('Timestamp'):
-                try: p_data['ts'] = int(pago.get('Timestamp'))
+                try: p_data['ts'] = int(safe_float(pago.get('Timestamp')))
                 except: pass
 
-            # Tasa Vigente
             tasa_row = obtener_tasa_vigente(p_data['ts'], tasas_list)
             
             match_found = None
             info_debug = ""
 
-            # Filtro Candidatos
             candidatos = [d for d in pool if d['disponible'] and d['nombre'] == p_data['nombre']]
 
             if candidatos and tasa_row:
                 best_diff = 1000
                 
                 for cand in candidatos:
-                    # 1. Matriz
                     factor = MATRIZ_GANANCIA.get(cand['moneda'], {}).get(p_data['moneda'])
                     if not factor: continue 
 
-                    # 2. Tasas
                     key_in = f"{cand['moneda']}+"
                     key_out = f"{p_data['moneda']}-"
                     
                     try:
-                        val_in = float(tasa_row.get(key_in, 0))
-                        val_out = float(tasa_row.get(key_out, 0))
+                        # Usamos safe_float para evitar errores con strings
+                        val_in = safe_float(tasa_row.get(key_in, 0))
+                        val_out = safe_float(tasa_row.get(key_out, 0))
                         
-                        # --- PROTECCIÓN ANTI-CRASH ---
+                        # --- VERIFICACIÓN CRÍTICA ---
                         if val_in > 0 and val_out > 0:
                             monto_teorico = cand['monto'] * (1/val_in) * val_out * factor
                             diff = abs(p_data['monto'] - monto_teorico) / p_data['monto']
@@ -184,7 +201,6 @@ def conciliar():
                                 info_debug = f"Match! Diff: {round(diff*100, 2)}% | Factor: {factor}"
                     except: continue
 
-            # Guardar Resultado
             res_data = {}
             if match_found:
                 match_found['disponible'] = False
@@ -195,7 +211,6 @@ def conciliar():
                     "INFO": info_debug
                 }
             else:
-                # DEBUG CUANDO FALLA
                 debug_msg = debug_match(p_data, pool, tasa_row)
                 res_data = {"STATUS": "PENDIENTE", "INFO": debug_msg}
             
